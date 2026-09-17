@@ -1,0 +1,11 @@
+/backups/
+/research/
+/使用說明.md
+*.log
+*.pdb
+*.exe
+*.dll
+!dist/LongRangeTargeting.dll
+.vs/
+obj/
+bin/
