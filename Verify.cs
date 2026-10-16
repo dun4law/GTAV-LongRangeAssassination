@@ -46,7 +46,7 @@ class Verify
         {
             byte[] exe = File.ReadAllBytes(args[1]);
             int[] hits = PatchLayout.Match(exe, "48 03 15 ?? ?? ?? ?? 4C 23 C2 49 8B 08");
-            Console.WriteLine("Local GTA5.exe script-table signature matches on disk: " + hits.Length + " (runtime scan is separately validated).");
+            Console.WriteLine("Local " + Path.GetFileName(args[1]) + " script-table signature matches on disk: " + hits.Length + " (runtime scan is separately validated; Enhanced may legitimately report 0).");
         }
     }
 }

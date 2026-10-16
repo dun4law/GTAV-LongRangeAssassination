@@ -25,8 +25,7 @@ public sealed class LongRangeTargeting : Script
     bool showStatusText, showDistance, showTargetBox = true, showBottomMessages = true;
     Color textColor = Color.FromArgb(235, 255, 255, 255);
     Color bottomColor = Color.FromArgb(235, 255, 220, 80);
-    int messageDuration = 1800, messageUntil;
-    string bottomMessage = "";
+    int messageDuration = 1800; // kept for ini compatibility; the game feed controls display time
     readonly MissionPatch patch;
     readonly Dictionary<int, RocketIdentity> observed = new Dictionary<int, RocketIdentity>();
     readonly List<LodSnapshot> lods = new List<LodSnapshot>();
@@ -55,6 +54,15 @@ public sealed class LongRangeTargeting : Script
     IntPtr outcomeAddress;
     int outcomeHealth;
     bool outcomeDead;
+    int stageStart, stageAssignedStart, stageCount, missionAssignedBase;
+    readonly int[] missionBuckets = new int[3];
+    readonly int[][] pathBuckets = { new int[3], new int[3] }; // [0]=clear, [1]=blocked at launch
+    int missionMaxFlight, nextPathCheck, missionAfterKill;
+    readonly List<int> farFlights = new List<int>();
+    bool pathCheck = true, pathBlocked;
+    int pathBlockedSamples, lastApproachSector = -2;
+    bool approachMarker = true, showTargetLabel = true, showImpactTimer = true;
+    readonly Dictionary<uint, int[]> weaponBuckets = new Dictionary<uint, int[]>();
 
     sealed class RocketIdentity
     {
@@ -65,6 +73,9 @@ public sealed class LongRangeTargeting : Script
         public IntPtr AssignedAddress;
         public int Started;
         public float LastDistance = -1f;
+        public int Ended = -1;
+        public bool BlockedAtLaunch;
+        public float EtaSmooth = -1f, SpeedSmooth = -1f;
     }
     sealed class LodSnapshot
     {
@@ -76,6 +87,7 @@ public sealed class LongRangeTargeting : Script
     public LongRangeTargeting()
     {
         folder = BaseDirectory;
+        RotateLog();
         patch = new MissionPatch(Log);
         Tick += OnTick; KeyDown += OnKeyDown;
         KeyUp += delegate(object sender, KeyEventArgs e) { pressedKeys.Remove(e.KeyCode); };
@@ -103,6 +115,8 @@ public sealed class LongRangeTargeting : Script
         showStatusText = config.GetValue<bool>("Display", "ShowStatusText", false);
         showDistance = config.GetValue<bool>("Display", "ShowDistance", false);
         showTargetBox = config.GetValue<bool>("Display", "ShowTargetBox", true);
+        showTargetLabel = config.GetValue<bool>("Display", "ShowTargetLabel", true);
+        showImpactTimer = config.GetValue<bool>("Display", "ShowImpactTimer", true);
         showBottomMessages = config.GetValue<bool>("Display", "ShowBottomMessages", true);
         messageDuration = Math.Max(300, Math.Min(10000, config.GetValue<int>("Display", "MessageDurationMs", 1800)));
         textColor = Color.FromArgb(ReadChannel(config, "TextAlpha", 235), ReadChannel(config, "TextRed", 255), ReadChannel(config, "TextGreen", 255), ReadChannel(config, "TextBlue", 255));
@@ -164,31 +178,86 @@ public sealed class LongRangeTargeting : Script
         lockRange = Math.Max(500f, Math.Min(10000f, lockRange));
         autoLock = config.GetValue<bool>("General", "AutoLock", false);
         playerPriority = config.GetValue<bool>("General", "PlayerPriorityStreaming", true);
-        Log("AutoLock=" + autoLock);
+        pathCheck = config.GetValue<bool>("General", "PathCheck", true);
+        approachMarker = config.GetValue<bool>("General", "ApproachMarker", true);
+        Log("AutoLock=" + autoLock + "; PathCheck=" + pathCheck);
         streaming = config.GetValue<bool>("General", "RemoteStreaming", true);
         preventEscape = config.GetValue<bool>("General", "PreventDistanceEscape", true);
     }
+    string lastStatus = "", lastShipStatus = "";
+    string logPath;
+    readonly string logStamp = DateTime.Now.ToString("yyyyMMdd-HHmmss");
     void Log(string message)
     {
         string entry = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss ") + message + Environment.NewLine;
-        try { File.AppendAllText(Path.Combine(folder, "LongRangeTargeting.log"), entry); }
-        catch (Exception ex)
+        // Something else can hold the log exclusively. Use the first location that accepts writes
+        // and keep using it: scripts folder, a per-session file beside it, then %TEMP%.
+        string[] candidates = {
+            Path.Combine(folder, "LongRangeTargeting.log"),
+            Path.Combine(folder, "LongRangeTargeting." + logStamp + ".log"),
+            Path.Combine(Path.GetTempPath(), "LongRangeTargeting.fallback.log") };
+        if (logPath != null)
         {
-            string fallback = Path.Combine(Path.GetTempPath(), "LongRangeTargeting.fallback.log");
-            try { File.AppendAllText(fallback, "Primary log failed: " + ex.Message + Environment.NewLine + entry); }
-            catch { System.Diagnostics.Trace.TraceError("LRT could not save its log: " + entry); }
-            if (!logWarningShown)
+            try { AppendShared(logPath, entry); return; }
+            catch { logPath = null; }
+        }
+        Exception first = null;
+        foreach (string candidate in candidates)
+        {
+            try
             {
-                logWarningShown = true;
-                try { Notify("Log error"); } catch { }
+                string text = entry;
+                if (first != null) text = "Log moved to " + candidate + ": " + first.Message + Environment.NewLine + entry;
+                AppendShared(candidate, text); logPath = candidate; return;
             }
+            catch (Exception ex) { if (first == null) first = ex; }
+        }
+        System.Diagnostics.Trace.TraceError("LRT could not save its log: " + entry);
+        if (!logWarningShown)
+        {
+            logWarningShown = true;
+            try { Notify("Log error"); } catch { }
         }
     }
-    void Notify(string text) { bottomMessage = text; messageUntil = Game.GameTime + messageDuration; }
-    void DrawNotification()
+    static void AppendShared(string path, string text)
     {
-        if (showBottomMessages && Game.GameTime < messageUntil)
-            DrawText(bottomMessage, .5f, .90f, .38f, true, bottomColor);
+        using (var stream = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete))
+        {
+            byte[] bytes = new System.Text.UTF8Encoding(false).GetBytes(text);
+            stream.Write(bytes, 0, bytes.Length);
+        }
+    }
+    void RotateLog()
+    {
+        try
+        {
+            string path = Path.Combine(folder, "LongRangeTargeting.log");
+            var info = new FileInfo(path);
+            if (info.Exists && info.Length > 1024 * 1024)
+            {
+                string old = Path.Combine(folder, "LongRangeTargeting.old.log");
+                if (File.Exists(old)) File.Delete(old);
+                File.Move(path, old);
+            }
+        }
+        catch { }
+    }
+    // Posts a boxed message with icon, title and subtitle to the game's own notification feed
+    // (top left), in the same style as other mods' news/status messages.
+    int Notify(string text)
+    {
+        if (!showBottomMessages) return -1;
+        Function.Call(Hash.BEGIN_TEXT_COMMAND_THEFEED_POST, "STRING");
+        Function.Call(Hash.ADD_TEXT_COMPONENT_SUBSTRING_PLAYER_NAME, text);
+        return Function.Call<int>(Hash.END_TEXT_COMMAND_THEFEED_POST_MESSAGETEXT, "CHAR_DEFAULT", "CHAR_DEFAULT", false, 1, "LongRangeTargeting", "Targeting System");
+    }
+    int pathFeed = -1, pathClearSamples, nextPathMessage;
+    // The "Path blocked" notice stays up only while the path is blocked.
+    void RemovePathMessage()
+    {
+        if (pathFeed < 0) return;
+        try { Function.Call(Hash.THEFEED_REMOVE_ITEM, pathFeed); } catch { }
+        pathFeed = -1;
     }
     bool Online() { return Function.Call<bool>(Hash.NETWORK_IS_SESSION_STARTED); }
     bool ValidTarget()
@@ -256,7 +325,6 @@ public sealed class LongRangeTargeting : Script
         try
         {
             RefreshUiSettings();
-            if (!Game.IsPaused && !Function.Call<bool>(Hash.IS_CUTSCENE_ACTIVE)) DrawNotification();
             if (!enabled) return;
             TrackOutcomes();
             if (Online()) { Shutdown(); return; }
@@ -266,14 +334,19 @@ public sealed class LongRangeTargeting : Script
             bool isPilot = Pilot(out pilotedPlane);
             if (Game.GameTime >= nextScan)
             {
-                nextScan = Game.GameTime + 250;
+                // Rescan quickly while a mission has no valid target so the next stage locks sooner.
+                nextScan = Game.GameTime + (mission && !ValidTarget() ? 100 : 250);
                 bool running = Function.Call<int>(Hash.GET_NUMBER_OF_THREADS_RUNNING_THE_SCRIPT_WITH_THIS_HASH, PatchLayout.MissionHash) > 0;
                 if (mission && !running)
                 {
                     patch.Restore(); RestoreLods(); ClearFocus(); locked = false; target = null;
                     hasFocusPosition = false; routed = -1; applyAttempted = false;
+                    LogMissionSummary();
+                    pathBlocked = false; pathBlockedSamples = 0; lastApproachSector = -2; ClearApproachBlip(); RemovePathMessage();
+                    observed.Clear(); lastStatus = ""; lastShipStatus = "";
                     Log("Mission ended; reset per-mission state.");
                 }
+                if (running && !mission) { missionAssignedBase = assigned; stageCount = 0; }
                 mission = running;
                 if (mission)
                 {
@@ -296,13 +369,17 @@ public sealed class LongRangeTargeting : Script
                     nextLog = Game.GameTime + 10000;
                     Vehicle current = Game.Player.Character.CurrentVehicle;
                     if (current != null && current.Exists() && current.Model.IsBoat)
-                        Log("Ship status: vehicle=" + current.Handle + "; model=" + current.Model.Hash
+                    {
+                        string ship = "vehicle=" + current.Handle + "; model=" + current.Model.Hash
                             + "; driver=" + (current.Driver == Game.Player.Character) + "; locked=" + locked
-                            + "; targetValid=" + ValidTarget() + "; assigned=" + assigned);
-                    Log("Status: mission=" + mission + "; patched=" + patch.Applied + "; route=" + routed + "; target=" + (ValidTarget() ? target.Handle.ToString() : "missing") + "; locked=" + locked + "; assigned=" + assigned);
+                            + "; targetValid=" + ValidTarget();
+                        if (ship != lastShipStatus) { lastShipStatus = ship; Log("Ship status: " + ship + "; assigned=" + assigned); }
+                    }
+                    string state = "mission=" + mission + "; patched=" + patch.Applied + "; route=" + routed + "; target=" + (ValidTarget() ? target.Handle.ToString() : "missing") + "; locked=" + locked;
+                    if (state != lastStatus) { lastStatus = state; Log("Status: " + state + "; assigned=" + assigned); }
                 }
             }
-            if (!mission) { status = "WAITING"; DrawStatus(status); return; }
+            if (!mission) { if (ownedBlips.Count > 0) SweepOwnedBlips(); status = "WAITING"; DrawStatus(status); return; }
             if (!isPilot) { locked = false; ClearFocus(); DrawStatus("PLANE/BOAT DRIVER"); return; }
             if (streaming && hasFocusPosition && !remoteReleased)
             {
@@ -326,6 +403,7 @@ public sealed class LongRangeTargeting : Script
                 Log("Auto-locked mission ped=" + target.Handle + "; distance=" + target.Position.DistanceTo(plane.Position).ToString("0")
                     + "; vehicle=" + plane.Handle + "; type=" + (plane.Model.IsBoat ? "boat" : "plane"));
             }
+            CheckPath(plane);
             ProcessRockets(plane);
             status = !patch.Applied ? "LOADING" : !ValidTarget() ? "NO TARGET" : locked ? "LOCKED" : "READY";
             DrawStatus(status);
@@ -350,6 +428,7 @@ public sealed class LongRangeTargeting : Script
             target = ped; targetAddress = ped.MemoryAddress;
             outcomeTarget = ped; outcomeAddress = ped.MemoryAddress;
             outcomeHealth = ped.Health; outcomeDead = false;
+            stageStart = Game.GameTime; stageAssignedStart = assigned; stageCount++;
             RaiseLod(ped);
             Vehicle ride = ped.CurrentVehicle;
             if (ride != null && ride.Exists()) RaiseLod(ride);
@@ -462,8 +541,94 @@ public sealed class LongRangeTargeting : Script
             + "; vehicle=" + vehicle.Handle + "; distance=" + projectile.Position.DistanceTo(vehicle.Position).ToString("0"));
     }
 
+    // The game reports no killer for these missiles, so estimate: among rockets assigned to this
+    // target that ended within 2s (or are still flying), pick the one last seen closest to it.
+    void LogMissionSummary()
+    {
+        var text = new System.Text.StringBuilder();
+        foreach (var item in weaponBuckets)
+            text.Append(" ").Append(item.Key).Append("=").Append(item.Value[0]).Append("/").Append(item.Value[1]).Append("/").Append(item.Value[2]);
+        Log("Mission summary: stages=" + stageCount + "; missilesFired=" + (assigned - missionAssignedBase)
+            + "; endedUnder10m=" + missionBuckets[0] + "; ended10to100m=" + missionBuckets[1] + "; ended100mPlus=" + missionBuckets[2] + "; endedAfterTargetDead=" + missionAfterKill
+            + "; byPathAtLaunch(under10/10-100/100+): clear=" + pathBuckets[0][0] + "/" + pathBuckets[0][1] + "/" + pathBuckets[0][2]
+            + " blocked=" + pathBuckets[1][0] + "/" + pathBuckets[1][1] + "/" + pathBuckets[1][2]
+            + "; byWeapon(under10/10-100/100+):" + (text.Length == 0 ? " none" : text.ToString()));
+        string cap = "";
+        if (farFlights.Count >= 3)
+        {
+            int longest = 0; foreach (int f in farFlights) longest = Math.Max(longest, f);
+            int same = 0; foreach (int f in farFlights) if (Math.Abs(f - longest) <= 150) same++;
+            if (same >= 3) cap = "; likelyLifetimeCapMs=" + longest + " (" + same + " missiles ended 100m+ away at the same flight time)";
+        }
+        farFlights.Clear();
+        int measured = missionBuckets[0] + missionBuckets[1] + missionBuckets[2];
+        if (measured > 0)
+        {
+            Log("Missile range check: observedMaxFlightMs=" + missionMaxFlight + "; ended100mPlus=" + missionBuckets[2] + "/" + measured + cap
+                + (missionBuckets[2] * 2 > measured
+                    ? "; advice=most missiles disappeared 100m+ from the target (likely range or lifetime limit); raise the Vehicle Weapons Range Increase range/lifetime setting"
+                    : "; advice=none"));
+        }
+        Array.Clear(missionBuckets, 0, 3); weaponBuckets.Clear(); missionMaxFlight = 0; missionAfterKill = 0;
+        Array.Clear(pathBuckets[0], 0, 3); Array.Clear(pathBuckets[1], 0, 3);
+    }
+
+    string LikelyMissile(Entity victim)
+    {
+        int bestId = 0; float best = float.MaxValue;
+        foreach (var item in observed)
+        {
+            RocketIdentity shot = item.Value;
+            if (shot.AssignedTarget == null || shot.AssignedAddress != victim.MemoryAddress) continue;
+            if (shot.Ended >= 0 && Game.GameTime - shot.Ended > 2000) continue;
+            if (shot.LastDistance >= 0 && shot.LastDistance < best) { best = shot.LastDistance; bestId = item.Key; }
+        }
+        return bestId == 0 ? "specific_missile_not_confirmed"
+            : "likely_missile=" + bestId + "; lastObservedDistance=" + best.ToString("0.0") + "; estimate_only";
+    }
+
+    void TrackRockets()
+    {
+        List<int> expired = null;
+        foreach (var item in observed)
+            if (item.Value.Ended >= 0 && Game.GameTime - item.Value.Ended > 10000)
+                (expired ?? (expired = new List<int>())).Add(item.Key);
+        if (expired != null) foreach (int key in expired) observed.Remove(key);
+        foreach (var item in observed)
+        {
+            RocketIdentity shot = item.Value;
+            if (shot.Projectile == null) continue;
+            if (!shot.Projectile.Exists() || shot.Projectile.MemoryAddress != shot.Address)
+            {
+                Log("Assigned rocket ended: projectile=" + item.Key + "; weapon=" + unchecked((uint)shot.Weapon)
+                    + "; target=" + shot.AssignedTarget.Handle + "; elapsedMs=" + (Game.GameTime - shot.Started)
+                    + "; lastObservedDistance=" + shot.LastDistance.ToString("0.0") + "; impact_not_confirmed");
+                shot.Projectile = null;
+                shot.Ended = Game.GameTime;
+                bool orphan = !shot.AssignedTarget.Exists() || shot.AssignedTarget.MemoryAddress != shot.AssignedAddress
+                    || shot.AssignedTarget.IsDead;
+                if (orphan) missionAfterKill++; // target already dead: its final distance says nothing about range
+                else if (shot.LastDistance >= 0)
+                {
+                    int bucket = shot.LastDistance < 10f ? 0 : shot.LastDistance < 100f ? 1 : 2;
+                    missionBuckets[bucket]++;
+                    pathBuckets[shot.BlockedAtLaunch ? 1 : 0][bucket]++;
+                    missionMaxFlight = Math.Max(missionMaxFlight, Game.GameTime - shot.Started);
+                    if (bucket == 2) farFlights.Add(Game.GameTime - shot.Started);
+                    int[] counts;
+                    uint weapon = unchecked((uint)shot.Weapon);
+                    if (!weaponBuckets.TryGetValue(weapon, out counts)) weaponBuckets[weapon] = counts = new int[3];
+                    counts[bucket]++;
+                }
+            }
+            else if (shot.AssignedTarget.Exists() && shot.AssignedTarget.MemoryAddress == shot.AssignedAddress)
+                shot.LastDistance = shot.Projectile.Position.DistanceTo(shot.AssignedTarget.Position);
+        }
+    }
+
     void TrackOutcomes()
     {
+        TrackRockets();
         if (outcomeTarget != null)
         {
             if (!outcomeTarget.Exists() || outcomeTarget.MemoryAddress != outcomeAddress)
@@ -483,25 +648,162 @@ public sealed class LongRangeTargeting : Script
                     outcomeDead = true;
                     uint cause = Function.Call<uint>(Hash.GET_PED_CAUSE_OF_DEATH, outcomeTarget.Handle);
                     int killer = Function.Call<int>(Hash.GET_PED_SOURCE_OF_DEATH, outcomeTarget.Handle);
+                    string likely = LikelyMissile(outcomeTarget);
                     Log("Target death confirmed: ped=" + outcomeTarget.Handle + "; causeWeapon=" + cause
-                        + "; sourceEntity=" + killer + "; specific_missile_not_confirmed");
+                        + "; sourceEntity=" + killer + "; " + likely);
+                    Log("Stage summary: stage=" + stageCount + "; elapsedMs=" + (Game.GameTime - stageStart)
+                        + "; missilesFired=" + (assigned - stageAssignedStart) + "; " + likely);
                 }
             }
         }
-        foreach (var item in observed)
+    }
+
+    // Straight-line check for map geometry (buildings and terrain) between the launcher and the
+    // locked target, plus a suggested open side to approach from. It warns only: it cannot change missile collision or the homing route, and
+    // far-away collision that is not streamed in may be missed.
+    void CheckPath(Vehicle vehicle)
+    {
+        // Advisory feature: never let it interfere with the mission or the game.
+        if (Game.IsPaused) return;
+        try { CheckPathCore(vehicle); }
+        catch (Exception ex)
         {
-            RocketIdentity shot = item.Value;
-            if (shot.Projectile == null) continue;
-            if (!shot.Projectile.Exists() || shot.Projectile.MemoryAddress != shot.Address)
-            {
-                Log("Assigned rocket ended: projectile=" + item.Key + "; weapon=" + unchecked((uint)shot.Weapon)
-                    + "; target=" + shot.AssignedTarget.Handle + "; elapsedMs=" + (Game.GameTime - shot.Started)
-                    + "; lastObservedDistance=" + shot.LastDistance.ToString("0.0") + "; impact_not_confirmed");
-                shot.Projectile = null;
-            }
-            else if (shot.AssignedTarget.Exists() && shot.AssignedTarget.MemoryAddress == shot.AssignedAddress)
-                shot.LastDistance = shot.Projectile.Position.DistanceTo(shot.AssignedTarget.Position);
+            pathCheck = false; ClearApproachBlip(); RemovePathMessage();
+            Log("Path check disabled after error: " + ex.Message);
         }
+    }
+    void CheckPathCore(Vehicle vehicle)
+    {
+        if (!pathCheck || Game.GameTime < nextPathCheck) return;
+        nextPathCheck = Game.GameTime + 1000;
+        if (!locked || !ValidTarget() || vehicle == null || !vehicle.Exists()) { if (pathBlocked) { RemovePathMessage(); Log("Path check stopped: no lock or target."); } pathBlocked = false; pathBlockedSamples = 0; lastApproachSector = -2; ClearApproachBlip(); return; }
+        Vector3 aim = target.Position + new Vector3(0, 0, 1f);
+        RaycastResult hit = World.Raycast(vehicle.Position, aim, IntersectFlags.Map, vehicle);
+        // A hit right at the target is its own window/ledge; anything further out (for example the
+        // far wall of the building it stands in) blocks the approach. Two consecutive samples
+        // are required so a single flicker does not flip the state.
+        bool raw = hit.DidHit && hit.HitPosition.DistanceTo(aim) > 5f;
+        pathBlockedSamples = raw ? pathBlockedSamples + 1 : 0;
+        pathClearSamples = raw ? 0 : pathClearSamples + 1;
+        // Enter "blocked" after two blocked samples; leave it only after two clear samples.
+        bool blocked = pathBlocked ? pathClearSamples < 2 : pathBlockedSamples >= 2;
+        if (blocked)
+        {
+            int sector = OpenApproachSector(aim, lastApproachSector);
+            bool sectorChanged = !pathBlocked || sector != lastApproachSector;
+            lastApproachSector = sector;
+            bool blipAlive = approachBlipHandle != 0 && Function.Call<bool>(Hash.DOES_BLIP_EXIST, approachBlipHandle);
+            // Keep the marker alive for as long as the path is blocked; recreate it if it vanished.
+            if (sectorChanged || (approachMarker && sector >= 0 && !blipAlive)) ShowApproachBlip(aim, sector);
+            // The game's notification fades after a few seconds, so repeat it while blocked.
+            if (sectorChanged || Game.GameTime >= nextPathMessage)
+            {
+                RemovePathMessage();
+                pathFeed = Notify(sector < 0 ? "~r~PATH BLOCKED~s~ - no open side found, no marker"
+                    : approachMarker ? "~r~PATH BLOCKED~s~ - fly to the yellow marker" : "~r~PATH BLOCKED");
+                nextPathMessage = Game.GameTime + 6000;
+            }
+            if (sectorChanged)
+            {
+                string advice = sector < 0 ? "no open side found"
+                    : "open approach from bearing " + (sector * 22.5f).ToString("0") + " deg (position the launcher on that side of the target)";
+                Log("Path blocked: obstacleAt=" + hit.HitPosition.DistanceTo(vehicle.Position).ToString("0")
+                    + "m of " + target.Position.DistanceTo(vehicle.Position).ToString("0") + "m; " + advice);
+            }
+        }
+        else if (pathBlocked)
+        {
+            lastApproachSector = -2; ClearApproachBlip(); RemovePathMessage();
+            Notify("~g~PATH CLEAR~s~ - missile path is open");
+            Log("Path clear.");
+        }
+        pathBlocked = blocked;
+    }
+
+    // Tests 16 compass sectors on an 800 m ring around the target; returns the clear sector whose
+    // bearing is closest to the launcher's current side, or -1 when every side is obstructed.
+    int approachBlipHandle;
+    void ShowApproachBlip(Vector3 aim, int sector)
+    {
+        ClearApproachBlip();
+        if (!approachMarker || sector < 0) return;
+        double angle = sector * Math.PI / 8.0;
+        float x = aim.X + (float)(Math.Sin(angle) * ApproachRing), y = aim.Y + (float)(Math.Cos(angle) * ApproachRing);
+        int blip = Function.Call<int>(Hash.ADD_BLIP_FOR_COORD, x, y, aim.Z);
+        if (blip == 0) return;
+        Function.Call(Hash.SET_BLIP_SPRITE, blip, 1);
+        Function.Call(Hash.SET_BLIP_COLOUR, blip, 5);
+        Function.Call(Hash.SET_BLIP_SCALE, blip, 1.2f);
+        Function.Call(Hash.SET_BLIP_AS_SHORT_RANGE, blip, false);
+        Function.Call(Hash.SET_BLIP_FLASHES, blip, true);
+        Function.Call(Hash.BEGIN_TEXT_COMMAND_SET_BLIP_NAME, "STRING");
+        Function.Call(Hash.ADD_TEXT_COMPONENT_SUBSTRING_PLAYER_NAME, "LRT open approach");
+        Function.Call(Hash.END_TEXT_COMMAND_SET_BLIP_NAME, blip);
+        approachBlipHandle = blip; ownedBlips.Add(blip);
+        Log("Approach marker placed: x=" + x.ToString("0") + "; y=" + y.ToString("0"));
+    }
+    // Every marker this script ever created, so none can be left behind on the map.
+    readonly List<int> ownedBlips = new List<int>();
+    void ClearApproachBlip()
+    {
+        if (approachBlipHandle != 0) { int blip = approachBlipHandle; approachBlipHandle = 0; RemoveBlipSafely(blip); }
+        SweepOwnedBlips();
+    }
+    void SweepOwnedBlips()
+    {
+        for (int i = ownedBlips.Count - 1; i >= 0; i--)
+            if (RemoveBlipSafely(ownedBlips[i])) ownedBlips.RemoveAt(i);
+    }
+    // Returns true when the blip no longer exists (or is at least hidden). REMOVE_BLIP takes a
+    // pointer; this SHVDN rejects OutputArgument(int), so try several ways and log which one works.
+    bool RemoveBlipSafely(int blip)
+    {
+        try
+        {
+            if (!Function.Call<bool>(Hash.DOES_BLIP_EXIST, blip)) return true;
+            string[] names = { "Blip.Delete", "OutputArgument(long)", "OutputArgument(ulong)" };
+            for (int attempt = 0; attempt < names.Length; attempt++)
+            {
+                try
+                {
+                    if (attempt == 0) new Blip(blip).Delete();
+                    else if (attempt == 1) Function.Call(Hash.REMOVE_BLIP, new OutputArgument((long)blip));
+                    else Function.Call(Hash.REMOVE_BLIP, new OutputArgument((ulong)blip));
+                }
+                catch (Exception ex) { if (!removeBlipNoted) Log("Approach marker removal via " + names[attempt] + " failed: " + ex.Message); continue; }
+                if (!Function.Call<bool>(Hash.DOES_BLIP_EXIST, blip))
+                {
+                    if (!removeBlipNoted) { removeBlipNoted = true; Log("Approach marker removal works via " + names[attempt] + "."); }
+                    return true;
+                }
+            }
+            // Last resort: make it invisible and retry on the next sweep.
+            Function.Call(Hash.SET_BLIP_DISPLAY, blip, 0);
+            Function.Call(Hash.SET_BLIP_ALPHA, blip, 0);
+            if (!removeBlipNoted) { removeBlipNoted = true; Log("Approach marker " + blip + " could not be removed; hidden, will retry."); }
+            return false;
+        }
+        catch (Exception ex) { Log("Approach marker removal error: " + ex.Message); return false; }
+    }
+    bool removeBlipNoted;
+    const double ApproachRing = 800.0;
+
+    int OpenApproachSector(Vector3 aim, int prefer)
+    {
+        Vector3 from = Game.Player.Character.Position;
+        double current = Math.Atan2(from.X - aim.X, from.Y - aim.Y);
+        int best = -1; double bestDelta = double.MaxValue;
+        for (int i = 0; i < 16; i++)
+        {
+            double angle = i * Math.PI / 8.0;
+            Vector3 start = new Vector3(aim.X + (float)(Math.Sin(angle) * ApproachRing), aim.Y + (float)(Math.Cos(angle) * ApproachRing), aim.Z + 30f);
+            RaycastResult ray = World.Raycast(start, aim, IntersectFlags.Map);
+            if (ray.DidHit && ray.HitPosition.DistanceTo(aim) > 5f) continue;
+            if (i == prefer) return i; // keep the current suggestion while it is still open (no jumping marker)
+            double delta = Math.Abs(Math.Atan2(Math.Sin(angle - current), Math.Cos(angle - current)));
+            if (delta < bestDelta) { bestDelta = delta; best = i; }
+        }
+        return best;
     }
 
     void ProcessRockets(Vehicle vehicle)
@@ -541,18 +843,79 @@ public sealed class LongRangeTargeting : Script
             identity.AssignedAddress = targetAddress;
             identity.Projectile = projectile;
             identity.Started = Game.GameTime;
+            identity.BlockedAtLaunch = pathBlocked;
             identity.LastDistance = projectile.Position.DistanceTo(target.Position);
             assigned++;
             Log("Assigned fired rocket " + projectile.Handle + " weapon=" + projectile.WeaponHash + " to mission ped=" + target.Handle
-                + "; vehicle=" + vehicle.Handle + "; type=" + (vehicle.Model.IsBoat ? "boat" : "plane"));
+                + "; path=" + (pathBlocked ? "blocked" : "clear") + "; vehicle=" + vehicle.Handle + "; type=" + (vehicle.Model.IsBoat ? "boat" : "plane"));
         }
         var expired = new List<int>();
-        foreach (var item in observed) if (!live.Contains(item.Key)) expired.Add(item.Key);
+        foreach (var item in observed)
+        {
+            if (live.Contains(item.Key)) continue;
+            // Keep recently ended assigned rockets: TrackRockets prunes them after 10 s and the kill
+            // attribution needs them for a moment after they disappear.
+            if (item.Value.Ended >= 0 && Game.GameTime - item.Value.Ended <= 10000) continue;
+            expired.Add(item.Key);
+        }
         foreach (int id in expired) observed.Remove(id);
+    }
+
+    // Estimated time until the nearest assigned missile reaches the target, from its distance and
+    // closing speed. An estimate only: missiles can lose lifetime, turn or hit something first.
+    float impactEtaMax;
+    void DrawImpactTimer()
+    {
+        if (!showImpactTimer || !ValidTarget()) return;
+        int flying = 0; float best = float.MaxValue;
+        foreach (var item in observed)
+        {
+            RocketIdentity shot = item.Value;
+            Projectile rocket = shot.Projectile;
+            if (rocket == null || shot.AssignedAddress != targetAddress) continue;
+            if (!rocket.Exists() || rocket.MemoryAddress != shot.Address) continue;
+            Vector3 toTarget = target.Position - rocket.Position;
+            float distance = toTarget.Length();
+            if (distance < 1f) continue;
+            flying++;
+            // Low-pass the closing speed, then let the shown ETA count down with real time and
+            // ease toward the estimate, so a missile accelerating or turning does not make it jump.
+            float dt = Math.Max(.001f, Math.Min(.1f, Game.LastFrameTime));
+            float closing = Vector3.Dot(rocket.Velocity, toTarget / distance);
+            if (closing < 5f) continue;
+            shot.SpeedSmooth = shot.SpeedSmooth < 0f ? closing : shot.SpeedSmooth + (closing - shot.SpeedSmooth) * Math.Min(1f, dt * 1.2f);
+            float raw = distance / Math.Max(5f, shot.SpeedSmooth);
+            if (shot.EtaSmooth < 0f) shot.EtaSmooth = raw;
+            else
+            {
+                shot.EtaSmooth = Math.Max(0f, shot.EtaSmooth - dt);
+                shot.EtaSmooth += (raw - shot.EtaSmooth) * Math.Min(1f, dt * .6f);
+            }
+            best = Math.Min(best, shot.EtaSmooth);
+        }
+        if (flying == 0) { impactEtaMax = 0f; return; }
+        bool known = best < 3600f;
+        if (known) impactEtaMax = Math.Max(impactEtaMax, best);
+        float progress = known && impactEtaMax > 0.5f ? Math.Max(0f, Math.Min(1f, 1f - best / impactEtaMax)) : 0f;
+        int r = 255, g = 210, bl = 40;
+        if (known && best < 5f) { g = 70; bl = 50; }
+        // Dark panel: accent strip, label + count, large countdown, progress bar.
+        const float cx = .5f, cy = .085f, pw = .17f, ph = .072f;
+        float left = cx - pw / 2f, top = cy - ph / 2f;
+        Function.Call(Hash.DRAW_RECT, cx, cy, pw, ph, 0, 0, 0, 150, false);
+        Function.Call(Hash.DRAW_RECT, left + .0015f, cy, .003f, ph, r, g, bl, 235, false);
+        DrawText("IMPACT", left + .012f, top + .004f, .26f, false, Color.FromArgb(220, 200, 200, 200));
+        DrawText(flying + " IN FLIGHT", cx + .012f, top + .004f, .26f, false, Color.FromArgb(220, 200, 200, 200));
+        DrawText(known ? Math.Ceiling(best).ToString("0") + " s" : "--", cx, top + .014f, .62f, true, Color.FromArgb(245, r, g, bl));
+        float trackWidth = pw - .024f, trackLeft = left + .012f, trackY = top + ph - .009f;
+        Function.Call(Hash.DRAW_RECT, trackLeft + trackWidth / 2f, trackY, trackWidth, .004f, 255, 255, 255, 60, false);
+        if (progress > 0f)
+            Function.Call(Hash.DRAW_RECT, trackLeft + trackWidth * progress / 2f, trackY, trackWidth * progress, .004f, r, g, bl, 235, false);
     }
 
     void DrawStatus(string message)
     {
+        DrawImpactTimer();
         bool valid = ValidTarget();
         if (showStatusText)
         {
@@ -568,11 +931,28 @@ public sealed class LongRangeTargeting : Script
                 if (Function.Call<bool>(Hash.GET_SCREEN_COORD_FROM_WORLD_COORD, p.X, p.Y, p.Z, sx, sy))
                 {
                     float x = sx.GetResult<float>(), y = sy.GetResult<float>();
-                    int r = 255, g = locked ? 50 : 210;
-                    Function.Call(Hash.DRAW_RECT, x, y - .012f, .02f, .002f, r, g, 40, 230, false);
-                    Function.Call(Hash.DRAW_RECT, x, y + .012f, .02f, .002f, r, g, 40, 230, false);
-                    Function.Call(Hash.DRAW_RECT, x - .01f, y, .001f, .026f, r, g, 40, 230, false);
-                    Function.Call(Hash.DRAW_RECT, x + .01f, y, .001f, .026f, r, g, 40, 230, false);
+                    float distance = target.Position.DistanceTo(Game.Player.Character.Position);
+                    // Corner brackets that shrink with distance but stay readable.
+                    float hx = Math.Max(.008f, Math.Min(.022f, .023f - distance / 280000f));
+                    float aspect = Function.Call<float>(Hash.GET_ASPECT_RATIO, false);
+                    if (aspect < .5f) aspect = 16f / 9f;
+                    float hy = hx * aspect, lx = hx * .55f, ly = hy * .55f, tx = .0012f, ty = .0012f * aspect;
+                    int r, g, b;
+                    string state;
+                    if (locked && pathBlocked) { r = 255; g = 140; b = 0; state = "LOCKED - PATH BLOCKED"; }
+                    else if (locked) { r = 255; g = 50; b = 40; state = "LOCKED"; }
+                    else { r = 255; g = 210; b = 40; state = "TARGET"; }
+                    for (int cx = -1; cx <= 1; cx += 2)
+                        for (int cy = -1; cy <= 1; cy += 2)
+                        {
+                            Function.Call(Hash.DRAW_RECT, x + cx * (hx - lx / 2f), y + cy * hy, lx, ty, r, g, b, 235, false);
+                            Function.Call(Hash.DRAW_RECT, x + cx * hx, y + cy * (hy - ly / 2f), tx, ly, r, g, b, 235, false);
+                        }
+                    if (showTargetLabel)
+                    {
+                        string dist = distance >= 1000f ? (distance / 1000f).ToString("0.0") + " km" : distance.ToString("0") + " m";
+                        DrawText(state + " | " + dist, x, y + hy + .006f, .26f, true, Color.FromArgb(235, r, g, b));
+                    }
                 }
             }
         }
@@ -598,7 +978,7 @@ public sealed class LongRangeTargeting : Script
     void Shutdown()
     {
         outcomeTarget = null;
-        enabled = false; locked = false;
+        enabled = false; locked = false; ClearApproachBlip(); RemovePathMessage();
         try { patch.Restore(); } catch (Exception ex) { Log("Restore warning: " + ex.Message + "; restarting GTA clears runtime-only patches."); }
         try { RestoreLods(); } catch (Exception ex) { Log("LOD restore warning: " + ex.Message); }
         try { ClearFocus(); } catch { }

@@ -18,7 +18,7 @@ Currently supports Lester's **The Multi Target Assassination**, not every assass
 
 ### Requirements and installation
 
-1. GTA V Legacy PC, Story Mode.
+1. GTA V PC, Story Mode: Legacy, or Enhanced 1.0.1158.16 (one script, the edition is detected at runtime).
 2. Install [Script Hook V](https://www.dev-c.com/gtav/scripthookv/) compatible with your game version.
 3. Install [ScriptHookVDotNet](https://github.com/scripthookvdotnet/scripthookvdotnet) compatible with **API 3.7.0**. This script uses `ProjectileRocket`; older frameworks may not load it.
 4. **For long-range attacks, install and configure [Vehicle Weapons Range Increase](https://www.gta5-mods.com/scripts/vehicle-weapons-range-increase)** following its author's instructions. This script handles spawning and additional targeting, not missile range or lifetime. Without enough range, missiles may disappear before reaching the target even after a successful lock.
@@ -38,7 +38,7 @@ Currently supports Lester's **The Multi Target Assassination**, not every assass
 
 ### Weapons and launch path
 
-**Install and configure Vehicle Weapons Range Increase first, then choose a suitable long-range weapon.** This script handles targeting, not extra weapon range or obstacle avoidance.
+**Install and configure Vehicle Weapons Range Increase first, then choose a suitable long-range weapon.** This script handles targeting, not extra weapon range. It does not steer missiles around obstacles; it only checks the straight line to the locked target and suggests an open side to approach from (log line `Path blocked: ... open approach from bearing`, plus a yellow map blip; `PathCheck` / `ApproachMarker` in the ini).
 
 - **Suggested weapon type:** use a long-range cruise missile or stand-off guided bomb with enough propulsion and lifetime for the distance.
 - The following add-ons are optional examples, not the only supported choices: [Panavia Tornado IDS](https://www.gta5-mods.com/vehicles/panavia-tornado-ids-add-on-vehfuncs-v) with Storm Shadow/Taurus-style loadouts
@@ -180,7 +180,7 @@ Long-Range Assassination 為「多重暗殺行動」帶來全新的玩法：從�
 
 ## 必備模組與安裝
 
-1. GTA V Legacy PC 故事模式。
+1. GTA V PC 故事模式：Legacy，或 Enhanced 1.0.1158.16（同一個腳本，執行時自動偵測版本）。
 2. 安裝與遊戲版本相容的 [Script Hook V](https://www.dev-c.com/gtav/scripthookv/)。
 3. 安裝 [ScriptHookVDotNet](https://github.com/scripthookvdotnet/scripthookvdotnet) **3.7.0 API** 相容版本。本工具使用 `ProjectileRocket` API；舊版框架可能無法載入。
 4. **遠距離玩法必備：安裝並依作者說明設定 [Vehicle Weapons Range Increase](https://www.gta5-mods.com/scripts/vehicle-weapons-range-increase)。** 本工具只處理任務生成與額外鎖定，不會延長導彈射程／壽命。若武器沒有足夠射程，即使成功鎖定，導彈仍可能在抵達前消失，無法完成遠距離攻擊。
@@ -201,7 +201,7 @@ Long-Range Assassination 為「多重暗殺行動」帶來全新的玩法：從�
 
 ## 武器選擇與發射路線
 
-**先安裝並設定 Vehicle Weapons Range Increase，再選擇適合遠距離攻擊的武器。** 本工具負責鎖定，不會增加武器射程，也不會讓導彈自動避開障礙物。
+**先安裝並設定 Vehicle Weapons Range Increase，再選擇適合遠距離攻擊的武器。** 本工具負責鎖定，不會增加武器射程，也不會讓導彈自動避開障礙物；只會檢查到鎖定目標的直線路徑，被建築或地形擋住時，在記錄寫出建議的開放接近方位，並在地圖上標出黃色接近點（可用 ini 的 `PathCheck`／`ApproachMarker` 關閉）。
 
 - **建議武器類型：** 使用具備足夠推力與續航的巡弋導彈或遠距離導引炸彈。
 以下附加模組只是示例，不是唯一選擇

@@ -119,9 +119,28 @@ namespace LongRangeSupport
                 throw new IOException("Mission bytecode write failed.");
         }
 
+        // The same compiled script runs on both editions. The edition is taken from the
+        // running executable: GTA5.exe (Legacy) or GTA5_Enhanced.exe (Enhanced).
+        const int EnhancedMajor = 1, EnhancedMinor = 0, EnhancedBuild = 1158, EnhancedRevision = 16;
+
         public void LocateTable()
         {
             var module = Process.GetCurrentProcess().MainModule;
+            string exe = Path.GetFileName(module.FileName);
+            bool enhanced = string.Equals(exe, "GTA5_Enhanced.exe", StringComparison.OrdinalIgnoreCase);
+            bool legacy = string.Equals(exe, "GTA5.exe", StringComparison.OrdinalIgnoreCase);
+            if (!enhanced && !legacy)
+                throw new InvalidDataException("Unsupported game executable '" + exe + "'; mission writes refused.");
+            if (enhanced)
+            {
+                // Verified on this build. On another build, warn and rely on the unique signature
+                // plus independent table validation below; any failure still refuses to write.
+                var version = FileVersionInfo.GetVersionInfo(module.FileName);
+                if (version.FileMajorPart != EnhancedMajor || version.FileMinorPart != EnhancedMinor
+                    || version.FileBuildPart != EnhancedBuild || version.FilePrivatePart != EnhancedRevision)
+                    log("Warning: Enhanced build " + version.FileVersion + " differs from verified 1.0.1158.16; continuing only if the table and script signatures validate.");
+            }
+
             long start = module.BaseAddress.ToInt64();
             byte[] dos = Read(start, 64);
             int pe = BitConverter.ToInt32(dos, 60);
@@ -138,12 +157,95 @@ namespace LongRangeSupport
                 if (size <= 0 || size > module.ModuleMemorySize || rva < 0 || (long)rva + size > module.ModuleMemorySize)
                     throw new InvalidDataException("Invalid executable text section.");
                 byte[] text = Read(start + rva, size);
-                foreach (int hit in PatchLayout.Match(text, "48 03 15 ?? ?? ?? ?? 4C 23 C2 49 8B 08"))
-                    candidates.Add(start + rva + hit + 7 + BitConverter.ToInt32(text, hit + 3));
+                // Legacy sequence first; the Enhanced 1.0.1158.16 sequence (from diagnostic logs,
+                // unique in .text) is the fast path there. Enhanced still passes ValidateTable below.
+                foreach (string signature in new string[] {
+                    "48 03 15 ?? ?? ?? ?? 4C 23 C2 49 8B 08",
+                    "48 03 15 ?? ?? ?? ?? 48 85 CA 74 28 48" })
+                {
+                    if (candidates.Count > 0) break; // Legacy match is authoritative; never mix signatures.
+                    foreach (int hit in PatchLayout.Match(text, signature))
+                    {
+                        long found = start + rva + hit + 7 + BitConverter.ToInt32(text, hit + 3);
+                        if (!candidates.Contains(found)) candidates.Add(found);
+                    }
+                }
             }
-            if (candidates.Count != 1) throw new InvalidDataException("Script-table signature must match once; found " + candidates.Count);
+            if (candidates.Count == 0 && enhanced)
+            {
+                // Enhanced can use a different instruction sequence. Identify the table
+                // by independently checking its entries and script program identities.
+                for (int s = 0; s < sections; s++)
+                {
+                    byte[] h = Read(start + pe + 24 + optional + 40 * s, 40);
+                    uint flags = BitConverter.ToUInt32(h, 36);
+                    int size = BitConverter.ToInt32(h, 8), rva = BitConverter.ToInt32(h, 12);
+                    if ((flags & 0x80000000u) == 0 || size < 28 || size > 0x4000000
+                        || rva < 0 || (long)rva + size > module.ModuleMemorySize) continue;
+                    byte[] data;
+                    try { data = Read(start + rva, size); } catch (IOException) { continue; }
+                    for (int offset = 0; offset <= data.Length - 28; offset += 8)
+                    {
+                        long entries = BitConverter.ToInt64(data, offset);
+                        int count = BitConverter.ToInt32(data, offset + 24);
+                        if (entries < 0x10000 || entries >= 0x0000800000000000L
+                            || (entries & 7) != 0 || count < 3 || count > 4096) continue;
+                        if (ValidateTable(entries, count)) candidates.Add(start + rva + offset);
+                    }
+                }
+                log("Enhanced table structure scan found " + candidates.Count + " validated candidate(s).");
+            }
+            if (candidates.Count != 1)
+                throw new InvalidDataException(enhanced
+                    ? "Script-table locator must validate exactly one table; found " + candidates.Count
+                    : "Script-table signature must match once; found " + candidates.Count);
             table = candidates[0];
-            log("Located Legacy script table.");
+            byte[] selected = Read(table, 28);
+            bool valid = ValidateTable(BitConverter.ToInt64(selected, 0), BitConverter.ToInt32(selected, 24));
+            if (enhanced)
+            {
+                if (!valid)
+                    throw new InvalidDataException("Script-table entries failed independent validation; no mission writes performed.");
+                log("Located validated script table for Enhanced 1.0.1158.16.");
+            }
+            else
+            {
+                // Legacy behaviour is unchanged: the unique signature match is authoritative.
+                // The structural check is logged for information only and never blocks Legacy.
+                log("Located Legacy script table." + (valid ? "" : " (structure check inconclusive; signature match used)"));
+            }
+        }
+
+        static bool ValidateTable(long entries, int count)
+        {
+            if (count < 3 || count > 4096) return false;
+            try
+            {
+                byte[] items = Read(entries, count * 16);
+                int validated = 0;
+                var programs = new HashSet<long>();
+                for (int i = 0; i < count && validated < 8; i++)
+                {
+                    long program = BitConverter.ToInt64(items, i * 16);
+                    if (program == 0) continue;
+                    if (!programs.Add(program)) return false;
+                    byte[] p = Read(program, 0x78);
+                    if (BitConverter.ToUInt32(p, 0x58) != BitConverter.ToUInt32(items, i * 16 + 12)) return false;
+                    int length = BitConverter.ToInt32(p, 0x1C);
+                    if (length <= 0 || length > 0x4000000) return false;
+                    byte[] name = Read(BitConverter.ToInt64(p, 0x60), 64);
+                    int end = Array.IndexOf(name, (byte)0);
+                    if (end < 1 || end > 63) return false;
+                    for (int n = 0; n < end; n++)
+                        if (!(name[n] >= 'a' && name[n] <= 'z') && !(name[n] >= 'A' && name[n] <= 'Z')
+                            && !(name[n] >= '0' && name[n] <= '9') && name[n] != '_') return false;
+                    Read(BitConverter.ToInt64(p, 0x10), 8);
+                    validated++;
+                }
+                return validated >= 3;
+            }
+            catch (IOException) { return false; }
+            catch (InvalidDataException) { return false; }
         }
 
         long FindProgram()
